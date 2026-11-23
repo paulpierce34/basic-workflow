@@ -1,0 +1,130 @@
+# Listens for new issues opened with the "SBOM Scan Request" issue form,
+# reads the form answers, and triggers the SBOM scan workflow on the user's
+# behalf — so they never have to touch the Actions tab directly.
+
+# How this works:
+#   1. User opens an issue using the "SBOM Scan Request" template
+#   2. This workflow parses the form answers (target repo, fail_on_critical)
+#   3. It calls `gh workflow run sbom-scan.yml` to kick off the actual scan
+#   4. It reacts to the issue and posts a status comment linking the run
+#
+# Secrets used:
+#   GH_SCAN_TOKEN  (optional) — fine-grained PAT if the target repo is
+#                 private/cross-org; falls back to GITHUB_TOKEN when unset.
+
+name: SBOM Scan Request Handler
+"on":
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write          # post a status comment on the request issue
+  contents: read         # needed to trigger another workflow in-repo
+
+jobs:
+  handle-scan-request:
+    runs-on: ubuntu-latest
+    # Only react to issues created from our form template
+    if: github.event.issue.state == 'open'
+    steps:
+      - name: Check this is an SBOM Scan Request
+        id: template_check
+        env:
+          TEMPLATE_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          # GitHub embeds the form answers in the issue body. Match on the
+          # label from scan-request.yml to distinguish it from other issues.
+          if echo "$TEMPLATE_BODY" | grep -q "Target repository"; then
+            echo "is_request=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_request=false" >> "$GITHUB_OUTPUT"
+            echo "Not an SBOM scan request; ignoring."
+          fi
+
+      - name: Parse target repository from form
+        if: steps.template_check.outputs.is_request == 'true'
+        id: parse
+        env:
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          # Issue form bodies look like:
+          #   ### Target repository
+          #   owner/repo
+          # Grab the line after the "Target repository" heading.
+          repo="$(echo "$BODY" | awk '/### Target repository/{getline; print; exit}' | xargs)"
+          if [[ -z "$repo" ]]; then
+            echo "::error::No target repository provided in the issue form"
+            exit 1
+          fi
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: Parse fail_on_critical from form
+        if: steps.template_check.outputs.is_request == 'true'
+        id: parse_fail
+        env:
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          choice="$(echo "$BODY" | awk '/### Fail build on CRITICAL findings\?/{getline; print; exit}' | xargs)"
+          if [[ "$choice" == "Yes" ]]; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: React to the request so the user knows it was picked up
+        if: steps.template_check.outputs.is_request == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              content: 'rocket'
+            })
+
+      - name: Trigger the SBOM scan workflow
+        if: steps.template_check.outputs.is_request == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ steps.parse.outputs.repo }}
+          FAIL_ON_CRITICAL: ${{ steps.parse_fail.outputs.value }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          # For cross-org or private target repos, swap GH_SCAN_TOKEN for a
+          # fine-grained PAT with 'contents: read' on the target repo.
+          TOKEN="${{ secrets.GH_SCAN_TOKEN || secrets.GITHUB_TOKEN }}"
+          # Kick off sbom-scan.yml via workflow_dispatch
+          gh workflow run sbom-scan.yml \
+            --ref "${{ github.ref_name }}" \
+            -f target_repository="$TARGET_REPO" \
+            -f fail_on_critical="$FAIL_ON_CRITICAL" \
+            -R "${{ github.repository }}"
+
+      - name: Post a status comment linking the run
+        if: steps.template_check.outputs.is_request == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Wait briefly so the workflow run exists before we link to it
+            await new Promise(r => setTimeout(r, 10000));
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const { data: runs } = await github.rest.actions.listWorkflowRuns({
+              owner, repo,
+              workflow_id: 'sbom-scan.yml',
+              per_page: 1
+            });
+            const run = runs.workflow_runs[0];
+            const runLink = run ? run.html_url : 'https://github.com/' + owner + '/' + repo + '/actions';
+            await github.rest.issues.createComment({
+              owner, repo,
+              issue_number: context.issue.number,
+              body: '🚀 Scan kicked off: [view run](' + runLink + ').\n' +
+                    'Results land in Code Scanning and as a `sbom-scan-results` artifact. ' +
+                    'I will update this thread when the run finishes.'
+            });
