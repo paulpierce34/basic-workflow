@@ -1,0 +1,122 @@
+# SBOM + Vulnerability Scan (Syft + Grype)
+#
+# Two ways to run this:
+#   1. Manually: Actions tab -> "SBOM + Vulnerability Scan" -> Run workflow
+#   2. Automatically: open an issue using the "SBOM Scan Request" issue form
+#      (.github/ISSUE_TEMPLATE/scan-request.yml). The issue-commands workflow
+#      below watches for those issues and kicks this off for you.
+
+# File layout (expected structure):
+#
+#   .github/
+#   ├── ISSUE_TEMPLATE/scan-request.yml   <- the form users fill out
+#   └── workflows/
+#       ├── issue-commands.yml            <- watches issues, triggers the scan
+#       └── sbom-scan.yml                 <- the Syft + Grype scan job
+#
+# Secrets used:
+#   GH_SCAN_TOKEN  (optional) — fine-grained PAT with 'contents: read' on the
+#                 target repo, needed if the target is private or cross-org.
+#                 Falls back to the built-in GITHUB_TOKEN when unset.
+#   GITHUB_TOKEN   (automatic) — used to comment back on the request issue.
+
+name: SBOM + Vulnerability Scan
+"on":
+  workflow_dispatch:
+    inputs:
+      target_repository:
+        description: "Target repo to scan (owner/repo or full URL)"
+        required: true
+        default: ""
+      fail_on_critical:
+        description: "Fail the job if CRITICAL vulns are found"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read          # clone the target repo
+  security-events: write  # upload SARIF to code scanning
+  issues: write           # comment results back on the triggering issue
+
+jobs:
+  sbom-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Normalize target repository input
+        id: target
+        env:
+          RAW: ${{ inputs.target_repository }}
+        run: |
+          set -euo pipefail
+          # Accept "owner/repo" or any GitHub URL and reduce it to owner/repo,
+          # so downstream steps never parse untrusted free text directly.
+          repo="$(echo "$RAW" | sed -E 's#https?://github\.com/##; s#\.git$##; s#^/##; s#/$##')"
+          if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Could not normalize '$RAW' into owner/repo format"
+            exit 1
+          fi
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "Scanning target: $repo"
+
+      - name: Check out target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.target.outputs.repo }}
+          # GITHUB_TOKEN can clone repos in the same org/user, or public repos.
+          # For cross-org private repos, use a fine-grained PAT stored as a secret.
+          token: ${{ secrets.GH_SCAN_TOKEN || github.token }}
+          path: target-repo
+
+      - name: Install Syft and Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Generate SBOM with Syft
+        run: |
+          syft scan dir:target-repo \
+            -o cyclonedx-json=target-repo.cdx.json \
+            -o spdx-json=target-repo.spdx.json \
+            -o syft-json=target-repo.syft.json
+
+      - name: Scan SBOM with Grype
+        env:
+          FAIL_ON_CRITICAL: ${{ inputs.fail_on_critical }}
+        run: |
+          set -o pipefail
+          grype sbom:target-repo.syft.json \
+            -o table \
+            -o sarif=target-repo.sarif \
+            -o json=target-repo.grype.json
+
+          # Optional gate: exit non-zero on critical findings
+          if [[ "$FAIL_ON_CRITICAL" == "true" ]]; then
+            crit="$(jq '[.matches[] | select(.vulnerability.severity == "Critical")] | length' target-repo.grype.json)"
+            echo "Critical vulnerabilities found: $crit"
+            if [[ "$crit" -gt 0 ]]; then
+              echo "::error::Failing due to $crit CRITICAL vulnerabilities"
+              exit 1
+            fi
+          fi
+
+      - name: Upload SARIF to Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: target-repo.sarif
+
+      - name: Upload all scan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-scan-results
+          path: |
+            target-repo.cdx.json
+            target-repo.spdx.json
+            target-repo.syft.json
+            target-repo.sarif
+            target-repo.grype.json
