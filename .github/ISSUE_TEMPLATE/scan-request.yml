@@ -1,0 +1,53 @@
+# GUI form to request a Syft + Grype scan without navigating to Actions.
+#
+# A user fills this issue template on the repo's issue page; the
+# issue-commands workflow (.github/workflows/issue-commands.yml) reads the
+# answers and triggers the SBOM scan workflow for them.
+
+name: SBOM Scan Request
+description: Request a Syft + Grype SBOM and vulnerability scan of a repository
+title: "[SBOM Scan] "
+labels: ["sbom-scan"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Fill this out and submit. A bot will pick this issue up, run Syft + Grype
+        against the target repo, upload SARIF to Code Scanning, and post results
+        back here. You can close the issue when you see the bot's report.
+
+  - type: input
+    id: target_repository
+    attributes:
+      label: Target repository
+      description: >
+        The repo to scan. Either `owner/repo` shorthand or a full GitHub URL
+        (e.g. https://github.com/owner/repo). Must be public, or in the same
+        org as this workflow file.
+      placeholder: "owner/repo"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: fail_on_critical
+    attributes:
+      label: Fail build on CRITICAL findings?
+      description: >
+        If yes, the workflow exits non-zero when Grype reports any CRITICAL
+        vulnerability, surfacing the failure visibly in Actions.
+      options:
+        - "No"
+        - "Yes"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: >
+            I confirm this is an authorized scan of a repo I own or have
+            explicit permission to test.
+          required: true
