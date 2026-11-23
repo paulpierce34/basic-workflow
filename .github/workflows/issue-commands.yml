@@ -20,6 +20,7 @@ name: SBOM Scan Request Handler
 permissions:
   issues: write          # post a status comment on the request issue
   contents: read         # needed to trigger another workflow in-repo
+  actions: write         # needed by `gh workflow run` (workflow_dispatch)
 
 jobs:
   handle-scan-request:
@@ -42,37 +43,42 @@ jobs:
             echo "Not an SBOM scan request; ignoring."
           fi
 
-      - name: Parse target repository from form
+      - name: Parse form answers
         if: steps.template_check.outputs.is_request == 'true'
         id: parse
         env:
           BODY: ${{ github.event.issue.body }}
         run: |
           set -euo pipefail
-          # Issue form bodies look like:
+          # GitHub issue forms render the body as:
           #   ### Target repository
+          #   <blank line>
           #   owner/repo
-          # Grab the line after the "Target repository" heading.
-          repo="$(echo "$BODY" | awk '/### Target repository/{getline; print; exit}' | xargs)"
-          if [[ -z "$repo" ]]; then
-            echo "::error::No target repository provided in the issue form"
+          #
+          # IMPORTANT: grab the first NON-BLANK line after each heading.
+          # An earlier version grabbed the line immediately after the heading
+          # (which is blank), so every run failed with
+          # "No target repository provided in the issue form".
+          repo="$(echo "$BODY" | awk '/^### Target repository/{f=1; next} f && NF {print; exit}')"
+          choice="$(echo "$BODY" | awk '/^### Fail build on CRITICAL findings\?/{f=1; next} f && NF {print; exit}')"
+
+          # Normalize: accept owner/repo or a full GitHub URL
+          repo="$(echo "$repo" | sed -E 's#https?://github\.com/##; s#\.git$##; s#^/##; s#/$##')"
+
+          if [[ -z "$repo" ]] || [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Could not parse target repository from the issue body (got: '$repo')"
             exit 1
           fi
-          echo "repo=$repo" >> "$GITHUB_OUTPUT"
 
-      - name: Parse fail_on_critical from form
-        if: steps.template_check.outputs.is_request == 'true'
-        id: parse_fail
-        env:
-          BODY: ${{ github.event.issue.body }}
-        run: |
-          set -euo pipefail
-          choice="$(echo "$BODY" | awk '/### Fail build on CRITICAL findings\?/{getline; print; exit}' | xargs)"
           if [[ "$choice" == "Yes" ]]; then
-            echo "value=true" >> "$GITHUB_OUTPUT"
+            fail_on_critical=true
           else
-            echo "value=false" >> "$GITHUB_OUTPUT"
+            fail_on_critical=false
           fi
+
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "fail_on_critical=$fail_on_critical" >> "$GITHUB_OUTPUT"
+          echo "Parsed: target=$repo fail_on_critical=$fail_on_critical"
 
       - name: React to the request so the user knows it was picked up
         if: steps.template_check.outputs.is_request == 'true'
@@ -91,13 +97,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TARGET_REPO: ${{ steps.parse.outputs.repo }}
-          FAIL_ON_CRITICAL: ${{ steps.parse_fail.outputs.value }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          FAIL_ON_CRITICAL: ${{ steps.parse.outputs.fail_on_critical }}
         run: |
           set -euo pipefail
-          # For cross-org or private target repos, swap GH_SCAN_TOKEN for a
-          # fine-grained PAT with 'contents: read' on the target repo.
-          TOKEN="${{ secrets.GH_SCAN_TOKEN || secrets.GITHUB_TOKEN }}"
           # Kick off sbom-scan.yml via workflow_dispatch
           gh workflow run sbom-scan.yml \
             --ref "${{ github.ref_name }}" \
